@@ -1,5 +1,5 @@
 ---
-title: Welcome to my blog
+title: 欢迎进入冥想盆
 ---
 
 这里是徐同学的冥想盆。不定期固化各种散乱的思绪。
@@ -8,10 +8,6 @@ title: Welcome to my blog
 
 请扶稳盆沿。
 
-3，
+3，2，1。
 
-2，
-
-1。
-
-欢迎来到我的世界。
+Link Start -----
