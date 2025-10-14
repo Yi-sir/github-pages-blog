@@ -1,9 +1,9 @@
  https://docs.sglang.ai/advanced_features/pd_disaggregation.html
 ## 0. Overview
 ### 0.1 Route
-![](attachments/sglang_pd_cluster.drawio.png)
+![](https://youke1.picui.cn/s1/2025/10/14/68edc85132dcd.png)
 ### 0.2 P&D Instance
-![](attachments/sglang_pd.png)
+![](https://youke1.picui.cn/s1/2025/10/14/68edc85137bc5.png)
 ## 1. 参数和设计
 ### 1.1 参考命令
 - prefill node
