@@ -16,21 +16,6 @@
 	- disaggregation-mode decode
 	- dist-init-addr \${decode_master_ip}:\${decode_master_port}
 	- nnodes/node-rank/tp-size/dp-size...
-### 1.1.1 Advanced Features
-https://github.com/sgl-project/sglang/blob/main/docs/advanced_features/router.md
-参考这里，可以使用如下命令来启动PD分离任务
-```shell
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --prefill http://prefill1:8000 9000 \
-    --prefill http://prefill2:8001 9001 \
-    --decode http://decode1:8002 \
-    --decode http://decode2:8003 \
-    --prefill-policy cache_aware \
-    --decode-policy round_robin
-```
-这个方法也会启动http_server，router默认是走rust
-router具体的实现好像在```sgl-router/src/lib.rs```
 ### 1.2 核心设计
 - 原本的scheduling event loop基础上，增加了non-blocking sender & receiver operations
 	- Prefill Server
@@ -175,6 +160,18 @@ tasks = [
 ]
 ```
 然后走到 [[#3.2.3 process]]，根据bootstrap_room分配decode节点和prefill节点的连接关系
+#### 2.3.1 Dynamic Scaling
+==这里有点坑，文档没讲明白==
+sglang的router支持动态扩容/缩容，但是对于PD分离的架构和普通的架构有不同的请求path和格式。文档里讲的```\add_worker```是普通情况使用的请求。
+```python
+# sgl-router/src/server.rs +626
+```
+对于PD分离的架构，需要用如下命令来增加worker
+```shell
+curl -v -X POST "http://localhost:30002/workers" -H "Content-Type: application/json" -d '{ "url": "http://localhost:30003", "worker_type": "decode"}'
+```
+删除worker看起来应该走```/workers/{url}```delete方法
+
 ## 3. Scheduler
 承接DP Controller的初始化，scheduler会在```run_scheduler_process```方法里决定运行哪个event loop。
 **每个rank都有自己的scheduler**
