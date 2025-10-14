@@ -73,6 +73,16 @@ router具体的实现好像在```sgl-router/src/lib.rs```
 	- 实际是一个```MooncakeKVBootstrapServer```对象```python/sglang/srt/disaggregation/mooncake/conn.py```，构造传入了host(127.0.0.1 by default)和disaggregation_bootstrap_port(8998 by default)
 	- 注册health请求和用于注册prefill节点的put请求、用于decode节点连接prefill节点的get请求
 	- 构造完成时，bootstrap server即开启工作线程，运行其event loop
+- **以generate请求为例说明一个P/D集群收到请求之后的行为**。generate请求由router发给P和D集群的master节点
+	- 调用tokenizer manager的```generate_request```方法 ```python/sglang/srt/entrypoints/http_server.py +533```
+		- self.\_tokenize_one_request
+			- 先tokenize。```input_ids, token_type_ids = await self._tokenize_texts```
+			- 构造```tokenized_object```，类型为```TokenizedGenerateReqInput```
+		- self.\_send_one_request
+			- self.send_to_scheduler.send_pyobj(tokenized_obj)。这是个zmq，port名称是scheduler_input_ipc_name，类型是PUSH
+		- self.\_wait_one_response
+	- 然后scheduler在event loop里调用```recv_request```方法，收到请求，广播给其它rank。
+		- 参见[[#3.1.2 recv_request]]
 ### 2.2 DP Controller
 ```python
 # python/sglang/srt/entrypoints/engine.py +827
@@ -221,7 +231,7 @@ self.kv_manager = self._init_kv_manager()
 				- **self.transfer_infos\[room]** = {}
 			- self.transfer_infos\[room]\[mooncake_session_id] = TransferInfo.from_zmq(waiting_req_bytes)
 			- 此时，**建立了decode节点和prefill节点的联系**，一个room可以对应一组mooncake会话的id
-			- 如果收集到了足够多的decode端信息，把room的状态修改为KVPoll.WaitingForInput（？）==这部分还得结合decode看看==
+			- 如果收集到了足够多的decode端信息，把room的状态修改为KVPoll.WaitingForInput
 - 初始化transfer_queues和executors，默认各4个；两两一组分配给4个线程运行transfer_worker
 	- 应该是用来处理kv transfer任务，```python/sglang/srt/disaggregation/mooncake/conn.py +609```
 	- 这部分为了保证逻辑连贯，放到prefill的send章节讲解
@@ -231,6 +241,9 @@ self.kv_manager = self._init_kv_manager()
 如果开了dp attn，那么还会根据req的类型划分为work_reqs和control_reqs
 然后在attn_tp组内广播work_reqs
 在整个tp组内广播control_reqs
+- 对于rank 0的src节点，会把数据序列化之后用torch.dist.broadcast广播出去
+- 对于其它节点，接收到tensor数据之后，需要先搬到cpu上再反序列化
+- 这里传输的主要是tokenizer的输出，也就是text、token id等
 #### 3.1.3 bootstrap
 参数校验和准备工作不看
 先把req塞到bootstrap队列里
@@ -391,9 +404,6 @@ if (int(engine_rank) == -1 ...):
 	}
 ```
 这之后，KVReceiver把上面三个参数分别记录在三个表然后向Prefill节点的握手线程注册kv args
-```python
-
-```
 ```python
 self.kv_mgr.prefill_attn_tp_size_table[self.bootstrap_addr] = self.prefill_attn_tp_size
 self.kv_mgr.prefill_dp_size_table[self.bootstrap_addr] = self.prefill_dp_size
