@@ -1,9 +1,9 @@
----
-title: "Sglang PD Disaggregation"
-date: 2025-10-11
----
-
-https://docs.sglang.ai/advanced_features/pd_disaggregation.html
+ https://docs.sglang.ai/advanced_features/pd_disaggregation.html
+## 0. Overview
+### 0.1 Route
+![](attachments/sglang_pd_cluster.drawio.png)
+### 0.2 P&D Instance
+![](attachments/sglang_pd.png)
 ## 1. 参数和设计
 ### 1.1 参考命令
 - prefill node
@@ -16,6 +16,21 @@ https://docs.sglang.ai/advanced_features/pd_disaggregation.html
 	- disaggregation-mode decode
 	- dist-init-addr \${decode_master_ip}:\${decode_master_port}
 	- nnodes/node-rank/tp-size/dp-size...
+### 1.1.1 Advanced Features
+https://github.com/sgl-project/sglang/blob/main/docs/advanced_features/router.md
+参考这里，可以使用如下命令来启动PD分离任务
+```shell
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --prefill http://prefill1:8000 9000 \
+    --prefill http://prefill2:8001 9001 \
+    --decode http://decode1:8002 \
+    --decode http://decode2:8003 \
+    --prefill-policy cache_aware \
+    --decode-policy round_robin
+```
+这个方法也会启动http_server，router默认是走rust
+router具体的实现好像在```sgl-router/src/lib.rs```
 ### 1.2 核心设计
 - 原本的scheduling event loop基础上，增加了non-blocking sender & receiver operations
 	- Prefill Server
@@ -50,7 +65,7 @@ https://docs.sglang.ai/advanced_features/pd_disaggregation.html
 下面小节顺序就是初始化的顺序
 ### 2.1 Tokenizer Manager
 ```python
-# python/sglang/srt/entrypoints/engine.py +130
+# python/sglang/srt/entrypoints/http_server.py +1254
 ```
 - **只有node rank 0上有tokenzier manager，因此全局也只有一个bootstrap server** python/sglang/srt/entrypoints/engine.py +833
 - 在tokenizer manager初始化过程中构造bootstrap server ```python/sglang/srt/managers/tokenizer_manager.py +310```
@@ -73,7 +88,7 @@ https://docs.sglang.ai/advanced_features/pd_disaggregation.html
 	-
 	- 然后考虑pp。这里不涉及pp，size是1，rank是0。
 	-
-	- 对**每个local tp rank**做操作
+	- 对**每个local tp rank**做操作  ```python/sglang/srt/managers/dp_parallel_controller.py +280```
 		- 计算dp attention相关参数
 			- attn_tp_size = tp_size // dp_size = 2
 			- attn_dp_rank = tp_rank(local) // attn_tp_size = \[0, 3]
@@ -119,14 +134,43 @@ ATTN_TP | 0    1    2    3    4    5    6    7  | 0    1    2    3    4    5    
 ```
 - 相同ATTN_DP的GPU共用一个zmq，从node 0的request dispatcher接收数据
 	- 例如：node 0的gpu 0和gpu 1共用一个zmq；全局总共8个zmq
+### 2.3 Router
+
+**新版的router可能是用rust写的，这里用python版本举例说明**
+
+generate请求发送到router，先随机分配一个合适的PD pair
+```python
+# sgl-router/py_src/sglang_router/mini_lb.py +290
+@app.post("/generate")
+async def handle_generage_request(request_data: dict):
+	prefill_server, bootstrap_port, decode_server = lb.select_pair()  # lb: load_balancer
+```
+这里的P/D server其实就是一对URL
+然后给每个请求生成bootstrap_room，这里是个64位随机数
+```python
+modified_request.update(
+	{
+		"bootstrap_host": [hostname] * batch_size,
+		"bootstrap_port": [bootstrap_port]* batch_size,
+		"bootstrap_room": [_generate_bootstrap_room() for _ in range(batch_size)],
+	}
+)
+```
+调用generate_stream或者generate方法，把请求发给prefill & decode server
+```python
+# sgl-router/py_src/sglang_router/mini_lb.py +95
+tasks = [
+	session.post(f"{prefill_server}/{endpoint}, json=modified_request"),
+	session.post(f"{decode_server}/{endpoint}, json=modified_request").
+]
+```
+然后走到 [[#3.2.3 process]]，根据bootstrap_room分配decode节点和prefill节点的连接关系
 ## 3. Scheduler
 承接DP Controller的初始化，scheduler会在```run_scheduler_process```方法里决定运行哪个event loop。
 **每个rank都有自己的scheduler**
 对于PD Disaggregation而且不禁用overlap的情况：
 - P Nodes：event_loop_overlap_disagg_prefill
 - D Nodes：event_loop_overlap_disagg_decode
-总体交互过程如下，参考 https://zhuanlan.zhihu.com/p/1941107169782138422
-<!-- <img src="sglang_pd_scheduler.png" width="500"> -->
 ### 3.1 Prefill
 ### 3.1.1 init
 ```python
@@ -172,15 +216,15 @@ self.kv_manager = self._init_kv_manager()
 	- 启动线程跑运行bootstrap_thread。**此线程实现握手的逻辑** ```python/sglang/srt/disaggregation/mooncake/conn.py +747```
 		- 第一阶段，decode节点发送room为None的请求
 			- prefill线程注册kv cache地址信息，和session id绑定，用于后续计算kv cache目标地址
-		- 第二阶段，decode节点发送包含合法room id的请求
-			- prefill记录传输参数（room --> mooncake_session_id --> TransferInfo）
+		- 第二阶段，decode节点发送包含合法bootstrap room id（这个参数来自request）的请求
+			- 如果是新的room（不在self.transfer_infos里面）
+				- **self.transfer_infos\[room]** = {}
+			- self.transfer_infos\[room]\[mooncake_session_id] = TransferInfo.from_zmq(waiting_req_bytes)
+			- 此时，**建立了decode节点和prefill节点的联系**，一个room可以对应一组mooncake会话的id
 			- 如果收集到了足够多的decode端信息，把room的状态修改为KVPoll.WaitingForInput（？）==这部分还得结合decode看看==
 - 初始化transfer_queues和executors，默认各4个；两两一组分配给4个线程运行transfer_worker
-	- 应该是用来处理kv transfer任务，暂时没细看 ```python/sglang/srt/disaggregation/mooncake/conn.py +609```
-
-```python
-# python/sglang/srt/disaggregation/prefill.py +320
-```
+	- 应该是用来处理kv transfer任务，```python/sglang/srt/disaggregation/mooncake/conn.py +609```
+	- 这部分为了保证逻辑连贯，放到prefill的send章节讲解
 #### 3.1.2 recv_request
 通过上面的scheduler_input_ipc_name从tokenizer获取request
 只有**pp rank0 && attn_tp_rank0**的进程需要接收request（这里结合上面的表格可以看出是合理的）
@@ -204,17 +248,105 @@ def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
 先调用```send_kv_chunk```，然后调用kv_sender的```send```方法
 ```python
 # python/sglang/srt/disaggregation/prefill.py +607
-def send_kv_chunk(self, reeq, last_chunk: bool = False, end_idx: Optional[int] = None)
+def send_kv_chunk(self, req, last_chunk: bool = False, end_idx: Optional[int] = None)
 ```
-
-
-
+- 一次发送整页的cache，例如如果page size是4，当前start-end有10个，那么只发8个
+- self.req_to_token_pool，好像是ReqToTokenPool类型 ```python/sglang/srt/mem_cache/memory_pool.py +61```
+	- 其核心变量self.req_to_token是一个shape为(size, max_context_len)的tensor，记录request --> token locations的映射，token locations代码里也称之为kv indices
+- 获取kv indices之后，计算出page indices（简单说就是kv indices除以page size）
+- 调用kv sender的send接口
+需要注意，这里是按照chunk发送的。所以为了标识发送完成，在发最后一个chunk时会额外带一些辅助信息。
 ```python
 # python/sglang/srt/disaggregation/mooncake/conn.py +989
 def send(self, kv_indices: npt.NDArray[np.int32])
 ```
+调用kv_mgr的add_transfer_request方法，这里也区分了是否是最后一个chunk
+```python
+# python/sglang/srt/disaggregation/mooncake/conn.py +872
+def add_transfer_request(self,
+						bootstrap_room,
+						kv_indices,
+						indice_slice,
+						is_last,
+						aux_index)
+```
+先构造transfer dst的信息，从前文来看，应该是一组mooncake会话id
+```python
+dst_infos = self.transfer_infos[bootstrap_room].keys()
+```
+根据dst_infos选择transfer_queue，把transfer request塞到队列里
+这里说，如此选择队列的目的是保证dst session相同的request都放到同一个队列里，从而允许针对failed sessions做early abort
+```python
+session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
+shard_idx = session_port_sum % len(self.transfer_queues)
 
-
+self.transfer_queues[shard_idx].put(
+	TransferKVChunk(
+		room=bootstrap_room,
+		prefill_kv_indices=kv_indices,
+		index_slice=index_slice,
+		is_last=is_last,
+		prefill_aux_index=aux_index,
+	)
+)
+```
+回到上面讲KVManager的部分，放到了transfer_queue里的任务会在```transfer_worker```线程上做处理
+这个线程具体的行为如下
+```python
+# python/sglang/srt/disaggregation/mooncake/conn.py +609
+reqs_to_be_processed = self.transfer_infos[kv_chunk.room].values()
+local_rank = self.attn_tp_rank * self.pp_size + self.pp_rank
+```
+取出来当前room对应的**所有kv transfer requests**，对每个请求做操作
+从decode节点向prefill节点注册的kv args信息里获取attn_tp_size
+```python
+# python/sglang/srt/disaggregation/mooncake/conn.py
+target_rank_registration_info = self.decode_kv_args_table[req.mooncake_session_id]
+```
+如果当前是**MLA后端**，或者self.attn_tp_size == target_rank_registration_info.dst_attn_tp_size，则会走self.send_kvcache方法
+```python
+ret = self.send_kvcache(
+	req.mooncake_session_id,                    # mooncake会话id
+	kv_chunk.prefill_kv_indices,                # 当前req的当前chunk对应的kv page id
+	target_rank_registration_info.dst_kv_ptrs,  #
+	chunked_dst_kv_indices,
+	executor
+)
+```
+先把连续的页合并到一起
+```python
+# python/sglang/srt/disaggregation/mooncake/conn.py +251
+prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(prefill_kv_indices, dst_kv_indices)
+```
+获得模型层数、每一层的kv ptr起始和末尾指针
+```python
+layers_params = [(src_kv_ptrs[layer_id], dst_kv_ptrs[layer_id], kv_item_len) for layer_id in range(layers_current_pp_stage)]
+```
+每一层都作为一个单独的任务提交给executor，实现并行调用
+不过具体传输也限制于executor的线程数
+每一次调用传输都是**同步的**
+也就是说，假如61层，executor有3个线程，那么总的传输时间是$\text{ceil}(61/3) * t$，t是传输一次的时间
+具体的传输任务实现是
+```python
+# python/sglang/srt/disaggregation/mooncake/conn.py +242
+def _transfer_data(self, mooncake_session_id, transfer_blocks):
+	src_addrs, dst_addrs, lengths = zip(*transfer_blocks)
+	return self.engine.batch_transfer_sync(
+		mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
+	)
+```
+这里的self.engine是```MooncakeTransferEngine```，在前面PrefillBootstrapQueue队列构造kv manager时初始化
+```python
+# python/sglang/srt/disaggregation/mooncake/transfer_engine.py +133
+def batch_transfer_sync(self,
+						session_id,
+						buffers,                  # src_addrs
+						peer_buffer_addresses,    # dst_addrs
+						lengths                   # lengths
+):
+	ret = self.engine.batch_transfer_sync_write(session, buffers, peer_buffer_address, lengths)
+```
+这里的self.engine就是mooncake.TransferEngine了，在mooncake库里面。
 ### 3.2 Decode
 #### 3.2.1 init
 decode端初始化过程中，关键是初始化DecodePreallocQueue
@@ -258,7 +390,10 @@ if (int(engine_rank) == -1 ...):
         "prefill_pp_size": self.pp_size,           # 1
 	}
 ```
-这之后，KVReceiver把上面三个参数分别记录在三个表中
+这之后，KVReceiver把上面三个参数分别记录在三个表然后向Prefill节点的握手线程注册kv args
+```python
+
+```
 ```python
 self.kv_mgr.prefill_attn_tp_size_table[self.bootstrap_addr] = self.prefill_attn_tp_size
 self.kv_mgr.prefill_dp_size_table[self.bootstrap_addr] = self.prefill_dp_size
@@ -307,7 +442,7 @@ else:
 				- 若P节点TP16 DP8：range((0 % 1) * (2 // 1), (0 % 1 + 1) * (2 // 1)) = range(0, 2)，也就是\[0, 1]
 				- 若P节点TP16 DP2：range((0 % 1) * (8 // 1), (0 % 1 + 1) * (8 // 1)) = range(0, 8)，也就是\[0, 7]
 	- self.target_dp_group
-		- 这个参数来自```req.data_parallel_rank```，在kv receiver初始化时传递。如果不是None，就采用这个值。否则是个prefill_dp_size范围内的随机数（这个随机没找到，参见文章： https://zhuanlan.zhihu.com/p/1938721371925493391 ）
+		- 这个参数来自```req.data_parallel_rank```，在kv receiver初始化时传递。如果不是None，就采用这个值。否则是个prefill_dp_size范围内的随机数（随机的根源变量是bootstrap_room。这个随机来自sgl-router，```sgl-router/py_src/sglang_router/mini_lb.py +369```，每个请求都会有不同的room id）
 - 返回值
 	- ```python
 	  # python/sglang/srt/disaggregation/common/conn.py +564
@@ -315,6 +450,11 @@ else:
 	  ```
 	  - 联系上面算出来的值，查询的是bootstrap server里**随机dp，一整组attn tp，pp0**，共ATTN_TP_SIZE个节点的ip和port信息
 	  - **这些信息存储到KVReceiver.kv_mgr.connection_pool里**
+从bootstrap server获得了一组Prefill节点信息之后，还要向这组Prefill节点的握手线程注册kv args
+```python
+# python/sglang/disaggregation/common/conn.py +379
+self._register_kv_args()
+```
 构造一个DecodeRequest，入队
 ```python
 self.queue.append(
