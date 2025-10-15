@@ -3,7 +3,7 @@
 ### 0.1 Route
 ![](https://youke1.picui.cn/s1/2025/10/14/68edc85132dcd.png)
 ### 0.2 P&D Instance
-![](https://youke1.picui.cn/s1/2025/10/14/68edc85137bc5.png)
+![](https://youke1.picui.cn/s1/2025/10/15/68ef041b7a39a.png)
 ## 1. 参数和设计
 ### 1.1 参考命令
 - prefill node
