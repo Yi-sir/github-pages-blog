@@ -130,6 +130,38 @@ ATTN_TP | 0    1    2    3    4    5    6    7  | 0    1    2    3    4    5    
 - 相同ATTN_DP的GPU共用一个zmq，从node 0的request dispatcher接收数据
 	- 例如：node 0的gpu 0和gpu 1共用一个zmq；全局总共8个zmq
 ### 2.3 Router
+#### 2.3.1 整体功能
+sglang的router支持的请求比较多，vllm的proxy只支持如下请求：
+- post /v1/comletions
+- post /v1/chat/completions
+- get /status
+- post /instance/add
+#### 2.3.2 和vllm对比
+从sglang这边看，router和PD节点的交互主要是
+- router收到请求之后，需要选出来一对PD pair，给request更新bootstrap_host、bootstrap_port、bootstrap_room信息，然后把请求发给PD节点
+- kv cache传输在PD pair之间进行，不经过router
+- 处理返回的信息
+
+vllm这边
+- proxy的代码看起来也是收到请求之后选择一个PD pair进行处理
+- kv cache传输在PD pair之间进行，不经过router【但是prefill和decode是怎么互相发现的？】
+- proxy只处理返回的信息
+
+差异
+- sglang的router启动时，prefill集群需要输入bootstrap port（默认8998），vllm不需要
+- 启动的语法略有出入
+	- router: --prefill prefill1:port1 bootstrap_port1   --prefill prefill2:port2 bootstrap_port2
+	- proxy: --prefill prefill1:port1 prefill2:port2
+- vllm只支持roundrobin
+
+vllm和sglang的kv cache传输机制**不太一样**
+- sglang是kv sender主动发
+	- 现在的代码，发送用到的参数在握手时就注册好了
+	- 如果改成在host上操作，可能要修改这部分逻辑
+	- D节点怎么判断收到了kv cache？poll？
+- vllm是kv consumer主动load
+
+#### 2.3.3 generate request handler
 
 **新版的router可能是用rust写的，这里用python版本举例说明**
 
@@ -160,7 +192,7 @@ tasks = [
 ]
 ```
 然后走到 [[#3.2.3 process]]，根据bootstrap_room分配decode节点和prefill节点的连接关系
-#### 2.3.1 Dynamic Scaling
+#### 2.3.4 Dynamic Scaling
 ==这里有点坑，文档没讲明白==
 sglang的router支持动态扩容/缩容，但是对于PD分离的架构和普通的架构有不同的请求path和格式。文档里讲的```\add_worker```是普通情况使用的请求。
 ```python
@@ -357,6 +389,26 @@ def batch_transfer_sync(self,
 	ret = self.engine.batch_transfer_sync_write(session, buffers, peer_buffer_address, lengths)
 ```
 这里的self.engine就是mooncake.TransferEngine了，在mooncake库里面。
+
+传输到最后一个chunk时，kv sender会额外发送一些辅助信息，然后检查最后这次传输的状态
+```python
+# python/sglang/srt/disaggregation/mooncake/conn.py +704
+if kv_chunk.is_last:
+	if self.pp_group.is_last_rank:
+		ret = self.send_aux()
+	polls.append(True if ret == 0 else False)
+	dst_ranks_infos.append((req.endpoint, req.dst_port, req.room))
+
+	if len(polls) == req.required_dst_info_num:
+		status = KVPoll.Success if all(polls) else KVPoll.Failed
+		self.update_status(req.room, status)
+		for endpoint, dst_port, room in dst_ranks_infos:
+			self.sync_status_to_decode_endpoint(
+				endpoint, dst_info, room, status, local_rank
+			)
+```
+如果发送成功了，就会更新decode端的状态（通过zmq），然后decode端在scheduler里检查
+对应[[#3.2.4 kv transfer]]
 ### 3.2 Decode
 #### 3.2.1 init
 decode端初始化过程中，关键是初始化DecodePreallocQueue
@@ -468,3 +520,48 @@ self.queue.append(
                 DecodeRequest(req=req, kv_receiver=kv_receiver, waiting_for_input=False)
             )
 ```
+#### 3.2.4 kv transfer
+P节点发送kv cache之后，通过zmq更新D节点的状态
+```python
+# python/sglang/srt/disaggregation/mooncake/conn.py +596
+def sync_status_to_decode_endpoint(self, remote, dst_port, room, status, prefill_rank):
+	self._connect(format_tcp_address(remote, dst_port), is_ipv6=is_valid_ipv6_address(remote)).send_multipart([str(room), str(status), str(prefill_rank)])
+```
+首先在decode thread上接收
+```python
+# python/sglang/srt/disaggregation/mooncake/conn.py +785
+msg = self.server_socket.recv_multipart()
+(bootstrap_room, status, prefill_rank) = msg
+
+status = int(status.decode("ascii"))
+bootstrap_room = int(bootstrap_room.decode("ascii"))
+prefill_rank = int(prefill_rank.decode("ascii"))
+
+if status == KVPoll.Success:
+	if bootstrap_room in self.request_status:
+		self.prefill_response_tracker[bootstrap_room].add(prefill_rank)
+		expected_response_num = (
+			self.required_prefill_response_num_table[bootstrap_room]
+		)
+		arrived_response_num = len(
+			self.prefill_response_tracker[bootstrap_room]
+		)
+		if arrived_response_num == expected_response_num:
+			self.update_status(bootstrap_room, KVPoll.Success)
+```
+然后在这里处理
+```python
+# python/sglang/srt/disaggregation/decode.py +938
+alloc_reqs = self.disagg_decode_transfer_queue.pop_transferred()
+self.waiting_queue.extend(alloc_reqs)
+```
+注意，这里poll之后要在attn_tp的通信组上做min的all reduce（min是因为需要知道每个rank是否都成功）
+```python
+# python/sglang/srt/disaggregation/utils.py +39
+def poll_and_all_reduce(pollers, gloo_group):
+	polls = [int(poller.poll()) for poller in pollers]
+	tensor_to_reduce = torch.tensor(polls, dtype=torch.int8, device='cpu')
+	dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=gloo_group)
+	return tensor_to_reduce.to_list()
+```
+也就对应着设计文档里的waiting queue，接下来就是推理过程了。
